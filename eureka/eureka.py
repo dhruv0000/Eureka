@@ -26,6 +26,9 @@ def main(cfg):
     logging.info(f"Project Root: {EUREKA_ROOT_DIR}")
 
     openai.api_key = os.getenv("OPENAI_API_KEY")
+    openai.api_base = os.getenv("OPENAI_API_BASE", "https://ai-gateway.andrew.cmu.edu")
+
+    print("OpenAI API Base:", openai.api_base)
 
     task = cfg.env.task
     task_description = cfg.env.description
