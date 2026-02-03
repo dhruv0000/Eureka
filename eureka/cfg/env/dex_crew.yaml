@@ -1,0 +1,3 @@
+task: DexCrewScrewDriver
+env_name: dex_crew
+description: control the XHand to rotate the screw/driver and advance the screw joint along +z while maintaining stable grasp.
