@@ -214,6 +214,7 @@ def main(cfg):
             rl_run.communicate()
             rl_filepath = f"env_iter{iter}_response{response_id}.txt"
             code_paths.append(f"env_iter{iter}_response{response_id}.py")
+            logging.info(f"Iteration {iter}: Code Run {response_id} log file: {rl_filepath}")
             try:
                 with open(rl_filepath, 'r') as f:
                     stdout_str = f.read() 
@@ -228,6 +229,11 @@ def main(cfg):
             content = ''
             traceback_msg = filter_traceback(stdout_str)
 
+            if traceback_msg != '':
+                logging.info(f"Iteration {iter}: Code Run {response_id} traceback detected. First line: {traceback_msg.splitlines()[0] if traceback_msg else 'n/a'}")
+            else:
+                logging.info(f"Iteration {iter}: Code Run {response_id} completed without traceback.")
+
             if traceback_msg == '':
                 # If RL execution has no error, provide policy statistics feedback
                 exec_success = True
@@ -236,6 +242,7 @@ def main(cfg):
                     if line.startswith('Tensorboard Directory:'):
                         break 
                 tensorboard_logdir = line.split(':')[-1].strip() 
+                logging.info(f"Iteration {iter}: Code Run {response_id} tensorboard dir: {tensorboard_logdir}")
                 tensorboard_logs = load_tensorboard_logs(tensorboard_logdir)
                 max_iterations = np.array(tensorboard_logs['gt_reward']).shape[0]
                 epoch_freq = max(int(max_iterations // 10), 1)
@@ -357,6 +364,7 @@ def main(cfg):
         
         # Execute the python file with flags
         rl_filepath = f"reward_code_eval{i}.txt"
+        logging.info(f"Eval {i}: log file {rl_filepath}")
         with open(rl_filepath, 'w') as f:
             process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',  
                                         'hydra/output=subprocess',
@@ -376,11 +384,17 @@ def main(cfg):
         rl_filepath = f"reward_code_eval{i}.txt"
         with open(rl_filepath, 'r') as f:
             stdout_str = f.read() 
+        traceback_msg = filter_traceback(stdout_str)
+        if traceback_msg != '':
+            logging.info(f"Eval {i}: traceback detected. First line: {traceback_msg.splitlines()[0] if traceback_msg else 'n/a'}")
+        else:
+            logging.info(f"Eval {i}: completed without traceback.")
         lines = stdout_str.split('\n')
         for i, line in enumerate(lines):
             if line.startswith('Tensorboard Directory:'):
                 break 
         tensorboard_logdir = line.split(':')[-1].strip() 
+        logging.info(f"Eval {i}: tensorboard dir: {tensorboard_logdir}")
         tensorboard_logs = load_tensorboard_logs(tensorboard_logdir)
         max_success = max(tensorboard_logs['consecutive_successes'])
         reward_code_final_successes.append(max_success)

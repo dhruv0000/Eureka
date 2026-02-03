@@ -367,7 +367,7 @@ class ShadowHandGPT(VecTask):
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.object_rot, self.goal_rot, self.fingertip_pos, self.object_pos)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.object_rot, self.goal_rot, self.object_angvel, self.object_linvel, self.actions)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.rew_buf[:] = compute_bonus(
@@ -763,32 +763,108 @@ import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def compute_reward(object_rot: torch.Tensor, goal_rot: torch.Tensor, fingertip_pos: torch.Tensor, object_pos: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+def compute_reward(
+    object_rot: torch.Tensor,
+    goal_rot: torch.Tensor,
+    object_angvel: torch.Tensor,
+    object_linvel: torch.Tensor,
+    actions: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Constants (temperatures and weights)
+    ori_temp: float = 3.5         # temperature for orientation alignment shaping (exp)
+    vel_temp: float = 0.02        # temperature for angular velocity alignment shaping (tanh)
+    speed_gate_temp: float = 6.0  # temperature for gating speed penalty when close to target
+
+    w_ori: float = 1.5            # weight for orientation reward
+    w_align: float = 0.8          # weight for angular velocity alignment reward
+    w_speed: float = 0.01         # weight for angular speed penalty
+    w_linvel: float = 0.005       # weight for linear velocity penalty
+    w_action: float = 0.001       # weight for action penalty
+
+    success_threshold: float = 0.1 # radians, threshold for success bonus
+    success_bonus_val: float = 0.5 # bonus awarded when within threshold
+    eps: float = 1e-6
+
     device = object_rot.device
-    
-    # Distance between object rotation and goal rotation
-    object_goal_rot_diff = torch.norm(object_rot - goal_rot, dim=1)
-    
-    # Distance between each fingertip and the object
-    fingertip_object_diff = torch.norm(fingertip_pos - object_pos.unsqueeze(1), dim=2)
-    avg_fingertip_object_diff = fingertip_object_diff.mean(dim=1)
-    
-    # Reward Components
-    rot_reward = -object_goal_rot_diff
-    fingertip_reward = -avg_fingertip_object_diff
-    
-    # Temperature parameters for reward normalization
-    rot_temperature = torch.tensor(1.0).to(device)
-    fingertip_temperature = torch.tensor(1.0).to(device)
-    
-    # Normalize reward components using exponential function
-    rot_reward_normalized = torch.exp(rot_reward / rot_temperature)
-    fingertip_reward_normalized = torch.exp(fingertip_reward / fingertip_temperature)
-    
-    # Combine normalized rewards
-    total_reward = rot_reward_normalized + fingertip_reward_normalized
-    
-    # Store individual reward components in a dictionary
-    reward_dict = {"rot_reward": rot_reward_normalized, "fingertip_reward": fingertip_reward_normalized}
-    
-    return total_reward, reward_dict
+    dtype = object_rot.dtype
+
+    # Normalize quaternions (assumed format [x, y, z, w])
+    obj_norm = torch.sqrt(torch.sum(object_rot * object_rot, dim=1) + eps)
+    goal_norm = torch.sqrt(torch.sum(goal_rot * goal_rot, dim=1) + eps)
+    q_obj = object_rot / obj_norm.unsqueeze(1)
+    q_goal = goal_rot / goal_norm.unsqueeze(1)
+
+    v_obj = q_obj[:, 0:3]
+    w_obj = q_obj[:, 3]
+    v_goal = q_goal[:, 0:3]
+    w_goal = q_goal[:, 3]
+
+    # Quaternion error q_err = q_goal * conj(q_obj)
+    v_conj = -v_obj
+    w_conj = w_obj
+    cross = torch.cross(v_goal, v_conj, dim=1)
+    dotvv = torch.sum(v_goal * v_conj, dim=1)
+    v_err = w_goal.unsqueeze(1) * v_conj + w_conj.unsqueeze(1) * v_goal + cross
+    w_err = w_goal * w_conj - dotvv
+
+    # Normalize error quaternion
+    q_err_norm = torch.sqrt(torch.sum(v_err * v_err, dim=1) + w_err * w_err + eps)
+    v_err = v_err / q_err_norm.unsqueeze(1)
+    w_err = w_err / q_err_norm
+
+    # Axis-angle from error quaternion
+    w_clamped = torch.clamp(w_err, -1.0, 1.0)
+    angle = 2.0 * torch.acos(w_clamped)
+    sin_half = torch.sqrt(torch.clamp(1.0 - w_clamped * w_clamped, min=0.0))
+    axis = v_err / (sin_half.unsqueeze(1) + eps)
+    r = axis * angle.unsqueeze(1)  # rotation error vector
+    r_norm = torch.sqrt(torch.sum(r * r, dim=1) + eps)
+
+    # Orientation alignment reward (0..1), high when orientation is close to goal
+    ori_rew = torch.exp(-ori_temp * r_norm)
+
+    # Angular velocity alignment: reward aligning object_angvel with -r (to reduce error)
+    ang_align_raw = -torch.sum(r * object_angvel, dim=1)
+    ang_align_rew = torch.tanh(vel_temp * ang_align_raw)
+    one_t = torch.tensor(1.0, device=device, dtype=dtype)
+    ang_align_pos = 0.5 * (ang_align_rew + one_t)  # map to [0,1]
+
+    # Penalize angular speed more when close to goal orientation (to prevent overshoot)
+    w_mag = torch.sqrt(torch.sum(object_angvel * object_angvel, dim=1) + eps)
+    gate = torch.exp(-speed_gate_temp * r_norm)
+    speed_pen = w_mag * gate
+
+    # Penalize object linear velocity (keep object stable in hand)
+    lin_mag = torch.sqrt(torch.sum(object_linvel * object_linvel, dim=1) + eps)
+    lin_pen = lin_mag
+
+    # Action penalty (smooth control)
+    act_pen = torch.mean(actions * actions, dim=1)
+
+    # Success bonus when within orientation threshold
+    thr_t = torch.tensor(success_threshold, device=device, dtype=dtype)
+    bonus_t = torch.tensor(success_bonus_val, device=device, dtype=dtype)
+    success_mask = (r_norm < thr_t)
+    success_bonus = success_mask.to(dtype) * bonus_t
+
+    # Total reward
+    total = (
+        w_ori * ori_rew
+        + w_align * ang_align_pos
+        - w_speed * speed_pen
+        - w_linvel * lin_pen
+        - w_action * act_pen
+        + success_bonus
+    )
+
+    components: Dict[str, torch.Tensor] = {
+        "ori_rew": w_ori * ori_rew,
+        "ang_align": w_align * ang_align_pos,
+        "speed_penalty": -w_speed * speed_pen,
+        "linvel_penalty": -w_linvel * lin_pen,
+        "action_penalty": -w_action * act_pen,
+        "success_bonus": success_bonus,
+        "orientation_error": r_norm,
+        "total": total,
+    }
+    return total, components
