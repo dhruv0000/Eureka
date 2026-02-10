@@ -1,0 +1,3 @@
+task: DexCrewNutBolt
+env_name: dex_crew_nutbolt
+description: rotate the nut/bolt efficiently while maintaining grasp and avoiding stalls or drops.
